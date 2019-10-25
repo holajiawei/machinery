@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/RichardKnop/machinery/v1/brokers/errs"
 	"github.com/RichardKnop/machinery/v1/brokers/iface"
@@ -34,7 +35,10 @@ type Broker struct {
 	// Queue where consumed tasks are pushed.
 	tskQueue chan []byte
 	// Queue where errors while processing tasks are pushed.
-	errQueue chan error
+	errQueue          chan error
+	consumerCtx       context.Context
+	consumerCtxCancel context.CancelFunc
+	stopConsume       int32
 }
 
 const (
@@ -138,14 +142,9 @@ func (b *Broker) Cleanup(cgs sarama.ConsumerGroupSession) error { return nil }
 // ConsumeClaim consumes the message sent to a topic and marks it as claimed.
 // This method is internally called by Sarama when consumer starts consuming.
 func (b *Broker) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
-	// Read message pushed to topic.
+	ctx, _ := context.WithCancel(b.consumerCtx)
 	for {
 		select {
-		// A way to stop this goroutine from b.StopConsuming
-		case <-b.GetStopChan():
-			// Close tasks queue so that new tasks wont be able to push.
-			close(b.tskQueue)
-			return nil
 		case msg := <-claim.Messages():
 			if msg != nil {
 				// Add tasks wait group. Once message is processed its marked as done.
@@ -158,6 +157,9 @@ func (b *Broker) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.Con
 				// restart its consumed again.
 				sess.MarkMessage(msg, "")
 			}
+		case <-ctx.Done():
+			fmt.Println("done consume claim")
+			return nil
 		}
 	}
 }
@@ -211,10 +213,7 @@ func (b *Broker) StartConsuming(cTag string, con int, tskPr iface.TaskProcessor)
 	}
 	// Call brokerfactory which initialized channels for stop and retry consumer.
 	b.Broker.StartConsuming(cTag, con, tskPr)
-	ctx := context.Background()
-	// Add consumer to wait group.
-	b.consumerWG.Add(1)
-	defer b.consumerWG.Done()
+	b.consumerCtx, b.consumerCtxCancel = context.WithCancel(context.Background())
 	// Initialize task queue.
 	b.tskQueue = make(chan []byte, con)
 	// Initialize error queue.
@@ -223,23 +222,34 @@ func (b *Broker) StartConsuming(cTag string, con int, tskPr iface.TaskProcessor)
 	for p := 0; p <= con; p++ {
 		go b.tskWorker(p, tskPr)
 	}
-	// Log all the errors while processing tasks.
-	go func() {
-		for err := range b.errQueue {
-			log.ERROR.Printf("task processing failed: %v", err)
-		}
-	}()
 	log.INFO.Printf("Waiting for tasks from topics: %s", strings.Join(b.getTopics(tskPr), ","))
-	if err := b.consumer.Consume(ctx, b.getTopics(tskPr), b); err != nil {
-		return b.GetRetry(), err
+
+	b.consumerWG.Add(1)
+	defer b.consumerWG.Done()
+
+	for {
+		if b.stopConsume != 0 {
+			return false, nil
+		}
+		if err := b.consumer.Consume(b.consumerCtx, b.getTopics(tskPr), b); err != nil {
+			log.ERROR.Printf("Error Kafka consume: %v", err)
+			return b.GetRetry(), nil
+		}
 	}
-	return b.GetRetry(), nil
 }
 
 // StopConsuming quits the loop.
 func (b *Broker) StopConsuming() {
 	b.Broker.StopConsuming()
-	// Waiting for consumer to be stopped.
+	// Increment stop consume flag.
+	atomic.AddInt32(&b.stopConsume, 1)
+	// Cancel the context so all consume claim stops and consume method stops.
+	b.consumerCtxCancel()
+	// Stop consumer group.
+	if err := b.consumer.Close(); err != nil {
+		log.ERROR.Printf("Error stopping Kafka consumer: %v", err)
+	}
+	// Wait for consmer group to exit.
 	b.consumerWG.Wait()
 	// Waiting for any tasks being processed to finish.
 	b.tasksWG.Wait()
